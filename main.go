@@ -3,18 +3,19 @@
 // HTTP-сервис, который пересылает запросы на api.telegram.org.
 // Разворачивается в локации, откуда Bot API доступен, и используется
 // клиентами из сетей, где он недоступен: клиенту достаточно заменить
-// базовый адрес Bot API (apiRoot) на адрес зеркала.
+// базовый адрес Bot API (apiRoot) на адрес зеркала и добавить заголовок
+// X-Relay-Secret.
 //
-// Схема URL: клиент ходит на /s/<RELAY_SECRET>/bot<token>/<method>,
-// зеркало проверяет секрет, срезает префикс и пересылает
-// /bot<token>/<method> дальше. Секрет в пути — чтобы зеркалом не мог
-// пользоваться кто попало и чтобы клиентам не требовались кастомные
-// заголовки.
+// Авторизация: секрет в заголовке (не в URL — пути попадают в логи
+// балансировщиков). Мультибот без БД: RELAY_BOTS=botId=secret,botId2=secret2 —
+// секрет привязан к конкретному боту (botId — число до «:» в токене,
+// зеркало достаёт его из пути /bot<token>/... и сверяет).
 //
 // Тела запросов и URL не логируются (в пути лежит токен бота).
 package main
 
 import (
+	"crypto/subtle"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -24,12 +25,46 @@ import (
 	"time"
 )
 
-func main() {
-	secret := os.Getenv("RELAY_SECRET")
-	if secret == "" {
-		log.Fatal("RELAY_SECRET не задан")
+// parseBots разбирает RELAY_BOTS: "123456=secretA, 789=secretB".
+func parseBots(raw string) map[string]string {
+	bots := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		id, secret, ok := strings.Cut(pair, "=")
+		id, secret = strings.TrimSpace(id), strings.TrimSpace(secret)
+		if !ok || id == "" || secret == "" {
+			log.Fatalf("RELAY_BOTS: ожидаю пары botId=secret, получил %q", pair)
+		}
+		bots[id] = secret
 	}
-	prefix := "/s/" + secret
+	return bots
+}
+
+// botIDFromPath достаёт ID бота из пути Bot API:
+// /bot<id>:<hash>/<method> и /file/bot<id>:<hash>/<path> (скачивание файлов).
+func botIDFromPath(path string) string {
+	rest, ok := strings.CutPrefix(path, "/bot")
+	if !ok {
+		rest, ok = strings.CutPrefix(path, "/file/bot")
+		if !ok {
+			return ""
+		}
+	}
+	id, _, ok := strings.Cut(rest, ":")
+	if !ok {
+		return ""
+	}
+	return id
+}
+
+func main() {
+	bots := parseBots(os.Getenv("RELAY_BOTS"))
+	if len(bots) == 0 {
+		log.Fatal("RELAY_BOTS не задан (формат: botId=secret,botId2=secret2)")
+	}
 
 	target, err := url.Parse("https://api.telegram.org")
 	if err != nil {
@@ -41,7 +76,8 @@ func main() {
 	proxy.Director = func(r *http.Request) {
 		baseDirector(r)
 		r.Host = target.Host
-		// Не тащим наружу ничего лишнего от платформы/балансировщика.
+		// Не тащим наружу ни секрет, ни служебное от платформы/балансировщика.
+		r.Header.Del("X-Relay-Secret")
 		r.Header.Del("X-Forwarded-For")
 		r.Header.Del("X-Real-Ip")
 	}
@@ -56,11 +92,12 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, prefix+"/") {
+		expected := bots[botIDFromPath(r.URL.Path)]
+		got := r.Header.Get("X-Relay-Secret")
+		if expected == "" || subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		r.URL.Path = strings.TrimPrefix(r.URL.Path, prefix)
 		proxy.ServeHTTP(w, r)
 	})
 
@@ -77,6 +114,6 @@ func main() {
 		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       180 * time.Second,
 	}
-	log.Printf("relay: слушаю :%s", port)
+	log.Printf("relay: слушаю :%s, ботов: %d", port, len(bots))
 	log.Fatal(srv.ListenAndServe())
 }
