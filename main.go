@@ -136,6 +136,15 @@ func main() {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Все запросы идут на один хост — держим пул keep-alive соединений
+	// (дефолт Go: 2 на хост, под параллельной нагрузкой это лишние
+	// TLS-рукопожатия на каждый запрос).
+	proxy.Transport = &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
 	baseDirector := proxy.Director
 	proxy.Director = func(r *http.Request) {
 		baseDirector(r)
